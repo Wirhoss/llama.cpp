@@ -25,6 +25,12 @@ ggml_add_backend_library(ggml-sycl
 
 file(GLOB   GGML_HEADERS_SYCL "*.hpp")
 file(GLOB   GGML_SOURCES_SYCL "*.cpp")
+if (GGML_SYCL_ENABLE_XMX)
+    message(STATUS "GGML_SYCL_ENABLE_XMX enabled")
+    target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_ENABLE_XMX)
+else()
+    list(REMOVE_ITEM GGML_SOURCES_SYCL "${CMAKE_CURRENT_SOURCE_DIR}/mmq-xmx.cpp")
+endif()
 file(GLOB   SRCS "template-instances/fattn-tile*.cpp")
 list(APPEND GGML_SOURCES_SYCL ${SRCS})
 file(GLOB   SRCS "template-instances/fattn-vec*.cpp")

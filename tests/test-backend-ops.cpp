@@ -4354,6 +4354,36 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_mul_mat_xmx_layout : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t first_n;
+    const int64_t next_n;
+
+    test_mul_mat_xmx_layout(ggml_type type, int64_t m, int64_t first_n, int64_t next_n)
+        : type(type), m(m), first_n(first_n), next_n(next_n) {}
+
+    std::string vars() override {
+        return std::string(ggml_type_name(type)) + "_xmx_layout,m=" + std::to_string(m) +
+               ",first_n=" + std::to_string(first_n) + ",next_n=" + std::to_string(next_n);
+    }
+    double max_nmse_err() override { return 5e-4; }
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2ULL * m * (first_n + next_n) * 256;
+    }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, 256, m);
+        ggml_tensor * first_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, first_n);
+        ggml_tensor * next_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, next_n);
+        ggml_tensor * first = ggml_mul_mat(ctx, a, first_input);
+        ggml_tensor * dependency = ggml_scale(ctx, ggml_sum(ctx, first), 0.0f);
+        ggml_tensor * output = ggml_mul_mat(ctx, a, next_input);
+        return ggml_add(ctx, output, ggml_repeat(ctx, dependency, output));
+    }
+    bool run_whole_graph() override { return true; }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -8864,6 +8894,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {9, 16}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 2048, n, 4096, {1, 1}, {1, 1}));
+        }
+        for (int64_t n : {17, 31, 64, 65, 128}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 4096, n, 4096, {1, 1}, {1, 1}));
+        }
+    }
+
+    // Exercise SoA -> XMX and XMX -> small-N/fallback transitions.
+    test_cases.emplace_back(new test_mul_mat_xmx_layout(GGML_TYPE_Q4_K, 2048, 8, 16));
+    for (int64_t next_n : {1, 16, 17, 512}) {
+        test_cases.emplace_back(new test_mul_mat_xmx_layout(GGML_TYPE_Q4_K, 4096, 128, next_n));
+    }
+    for (ggml_type type : {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_mul_mat_xmx_layout(type, 2048, 8, 16));
+        for (int64_t next_n : {1, 16, 65, 512}) {
+            test_cases.emplace_back(new test_mul_mat_xmx_layout(type, 2048, 64, next_n));
         }
     }
 
