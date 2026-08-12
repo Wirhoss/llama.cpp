@@ -222,7 +222,12 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 
 //////////////////////
 struct optimize_feature {
-    bool reorder=false;
+    bool reorder = false;
+    // Type-specific in-place DPAS tile layouts. Keep these separate from
+    // `reorder`: existing SoA consumers must never interpret row-tiled bytes.
+    bool q4_xmx = false;
+    bool q5_xmx = false;
+    bool q6_xmx = false;
 };
 
 struct sycl_device_info {

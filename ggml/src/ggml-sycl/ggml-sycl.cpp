@@ -77,6 +77,9 @@
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
+#ifdef GGML_SYCL_ENABLE_XMX
+#include "ggml-sycl/mmq-xmx.hpp"
+#endif
 
 #define MEM_SIZE_2M	0x00200000
 #define MEM_SIZE_1G	0x40000000
@@ -332,6 +335,12 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FORCE_MMQ: yes\n");
 #else
         GGML_LOG_INFO("  GGML_SYCL_FORCE_MMQ: no\n");
+#endif
+
+#if defined(GGML_SYCL_ENABLE_XMX)
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_XMX: yes\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_XMX: no\n");
 #endif
 
 #if defined(GGML_SYCL_GRAPH)
@@ -2643,11 +2652,23 @@ inline void ggml_sycl_op_mul_mat_sycl(
         if (src0->type != GGML_TYPE_F16) {
             scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
                                                  " : converting src0 to fp16");
-            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
-            GGML_ASSERT(to_fp16_sycl != nullptr);
             size_t ne = row_diff*ne00;
             src0_as_f16.alloc(ne);
-            to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+#ifdef GGML_SYCL_ENABLE_XMX
+            const auto *extra=static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+            if(src0->type==GGML_TYPE_Q4_K&&extra&&extra->optimized_feature.q4_xmx){
+                ggml_sycl_dequantize_q4_K_xmx_to_f16(ctx,src0_dd_i,src0_as_f16.get(),row_diff,ne00);
+            }else if(src0->type==GGML_TYPE_Q5_K&&extra&&extra->optimized_feature.q5_xmx){
+                ggml_sycl_dequantize_q5_K_xmx_to_f16(ctx,src0_dd_i,src0_as_f16.get(),row_diff,ne00);
+            }else if(src0->type==GGML_TYPE_Q6_K&&extra&&extra->optimized_feature.q6_xmx){
+                ggml_sycl_dequantize_q6_K_xmx_to_f16(ctx,src0_dd_i,src0_as_f16.get(),row_diff,ne00);
+            }else
+#endif
+            {
+                const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
+                GGML_ASSERT(to_fp16_sycl != nullptr);
+                to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            }
         }
         const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
                                          ? (const sycl::half *)src0_dd_i
@@ -3951,6 +3972,145 @@ static bool reorder_qw_q4_k(uint8_t * data_device, size_t size, size_t offset, d
     return true;
 }
 
+#ifdef GGML_SYCL_ENABLE_XMX
+static bool reorder_qw_q4_k_xmx(
+        uint8_t * data_device, int ncols, int nrows, size_t size, bool source_soa, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0 && nrows % 8 == 0 && size % sizeof(block_q4_K) == 0);
+    const int blocks=ncols/QK_K, row_tiles=nrows/8, total_tb=row_tiles*blocks;
+    sycl_reorder_temp_buffer tmp(stream,size);
+    if(!tmp){GGML_LOG_WARN("%s: failed to allocate %zu bytes, skipping XMX reorder\n",__func__,size);return false;}
+    auto *input=static_cast<uint8_t *>(tmp.ptr);
+    sycl::event copy_event;SYCL_CHECK(CHECK_TRY_ERROR(copy_event=stream->memcpy(input,data_device,size)));
+    if(!g_ggml_sycl_use_async_mem_op)copy_event.wait();
+    uint8_t *qs=data_device,*scales=qs+total_tb*1024;auto *dm=(sycl::half *)(scales+total_tb*96);
+    const int nblocks=nrows*blocks;const uint8_t*source_qs=input;
+    const uint8_t*source_scales=input+nblocks*128;const auto*source_dm=(const sycl::half2*)(source_scales+nblocks*12);
+    auto event=stream->parallel_for(total_tb,[=](auto index){
+        const int tb=index,rt=tb/blocks,b=tb%blocks;
+        const auto *source=(const block_q4_K *)input;
+        for(int g=0;g<8;++g)for(int lane=0;lane<16;++lane)for(int r=0;r<8;++r){
+            const int wi=(rt*8+r)*blocks+b;const uint8_t*p=source_soa?source_qs+wi*128+(g/2)*32:source[wi].qs+(g/2)*32;
+            const uint8_t q0=(g&1)?p[lane]>>4:p[lane]&15,q1=(g&1)?p[lane+16]>>4:p[lane+16]&15;
+            qs[tb*1024+(g*16+lane)*8+r]=q0|(q1<<4);
+        }
+        for(int j=0;j<12;++j)for(int r=0;r<8;++r){const int wi=(rt*8+r)*blocks+b;
+            scales[tb*96+j*8+r]=source_soa?source_scales[wi*12+j]:source[wi].scales[j];}
+        for(int r=0;r<8;++r){const int wi=(rt*8+r)*blocks+b;const sycl::half2 value=source_soa?source_dm[wi]:source[wi].dm;
+            dm[tb*16+r]=value[0];dm[tb*16+8+r]=value[1];}
+    });
+    if(!g_ggml_sycl_use_async_mem_op)event.wait_and_throw();
+    return true;
+}
+
+static bool restore_qw_q4_k_xmx_to_soa(
+        uint8_t * data_device, int ncols, int nrows, size_t size, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols%QK_K==0&&nrows%8==0&&size%sizeof(block_q4_K)==0);
+    const int blocks=ncols/QK_K,row_tiles=nrows/8,total_tb=row_tiles*blocks,nblocks=nrows*blocks;
+    sycl_reorder_temp_buffer tmp(stream,size);
+    if(!tmp){GGML_LOG_WARN("%s: failed to allocate %zu bytes; retaining XMX layout\n",__func__,size);return false;}
+    auto *input=static_cast<uint8_t *>(tmp.ptr);sycl::event copy_event;
+    SYCL_CHECK(CHECK_TRY_ERROR(copy_event=stream->memcpy(input,data_device,size)));
+    if(!g_ggml_sycl_use_async_mem_op)copy_event.wait();
+    const uint8_t *in_qs=input,*in_scales=in_qs+total_tb*1024;const auto *in_dm=(const sycl::half *)(in_scales+total_tb*96);
+    uint8_t *out_qs=data_device,*out_scales=out_qs+nblocks*128;auto *out_dm=(sycl::half2 *)(out_scales+nblocks*12);
+    auto event=stream->parallel_for(nblocks,[=](auto index){
+        const int wi=index,row=wi/blocks,b=wi%blocks,rt=row/8,r=row%8,tb=rt*blocks+b;
+        for(int j=0;j<128;++j){const int pair=j/32,pos=j%32,lane=pos&15;const bool high=pos>=16;
+            const uint8_t pe=in_qs[tb*1024+((2*pair)*16+lane)*8+r];
+            const uint8_t po=in_qs[tb*1024+((2*pair+1)*16+lane)*8+r];
+            const uint8_t qe=high?pe>>4:pe&15,qo=high?po>>4:po&15;out_qs[wi*128+j]=qe|(qo<<4);}
+        for(int j=0;j<12;++j)out_scales[wi*12+j]=in_scales[tb*96+j*8+r];
+        out_dm[wi]=sycl::half2{in_dm[tb*16+r],in_dm[tb*16+8+r]};
+    });
+    if(!g_ggml_sycl_use_async_mem_op)event.wait_and_throw();
+    return true;
+}
+
+static void pack_qw_q5_k_xmx(
+        const uint8_t *input,uint8_t *output,int ncols,int nrows,bool source_soa,dpct::queue_ptr stream){
+    GGML_ASSERT(input&&output&&ncols%QK_K==0&&nrows%8==0);
+    const int blocks=ncols/QK_K,row_tiles=nrows/8,total_tb=row_tiles*blocks,nblocks=nrows*blocks;
+    uint8_t *out_qs=output,*out_qh=out_qs+total_tb*1024,*out_scales=out_qh+total_tb*256;
+    auto *out_dm=reinterpret_cast<sycl::half *>(out_scales+total_tb*96);
+    const uint8_t *soa_qs=input,*soa_qh=soa_qs+nblocks*128,*soa_scales=soa_qh+nblocks*32;
+    const auto *soa_dm=reinterpret_cast<const sycl::half2 *>(soa_scales+nblocks*12);
+    const auto *source=reinterpret_cast<const block_q5_K *>(input);
+    stream->parallel_for(total_tb,[=](auto index){
+        const int tb=index,rt=tb/blocks,b=tb%blocks;
+        for(int g=0;g<8;++g)for(int lane=0;lane<16;++lane)for(int r=0;r<8;++r){
+            const int wi=(rt*8+r)*blocks+b;const uint8_t *p=source_soa?soa_qs+wi*128+(g/2)*32:source[wi].qs+(g/2)*32;
+            const uint8_t q0=(g&1)?p[lane]>>4:p[lane]&15,q1=(g&1)?p[lane+16]>>4:p[lane+16]&15;
+            out_qs[tb*1024+(g*16+lane)*8+r]=q0|(q1<<4);
+        }
+        for(int r=0;r<8;++r){const int wi=(rt*8+r)*blocks+b;
+            for(int j=0;j<32;++j)out_qh[tb*256+j*8+r]=source_soa?soa_qh[wi*32+j]:source[wi].qh[j];
+            for(int j=0;j<12;++j)out_scales[tb*96+j*8+r]=source_soa?soa_scales[wi*12+j]:source[wi].scales[j];
+            const sycl::half2 value=source_soa?soa_dm[wi]:source[wi].dm;
+            out_dm[tb*16+r]=value[0];out_dm[tb*16+8+r]=value[1];
+        }
+    });
+}
+
+static void pack_qw_q6_k_xmx(
+        const uint8_t *input,uint8_t *output,int ncols,int nrows,bool source_soa,dpct::queue_ptr stream){
+    GGML_ASSERT(input&&output&&ncols%QK_K==0&&nrows%8==0);
+    const int blocks=ncols/QK_K,row_tiles=nrows/8,total_tb=row_tiles*blocks,nblocks=nrows*blocks;
+    uint8_t *out_ql=output,*out_qh=out_ql+total_tb*1024;
+    auto *out_scales=reinterpret_cast<int8_t *>(out_qh+total_tb*512);
+    auto *out_d=reinterpret_cast<sycl::half *>(out_scales+total_tb*128);
+    const uint8_t *soa_ql=input,*soa_qh=soa_ql+nblocks*128;
+    const auto *soa_scales=reinterpret_cast<const int8_t *>(soa_qh+nblocks*64);
+    const auto *soa_d=reinterpret_cast<const sycl::half *>(soa_scales+nblocks*16);
+    const auto *source=reinterpret_cast<const block_q6_K *>(input);
+    stream->parallel_for(total_tb,[=](auto index){
+        const int tb=index,rt=tb/blocks,b=tb%blocks;
+        for(int r=0;r<8;++r){const int wi=(rt*8+r)*blocks+b;
+            for(int j=0;j<128;++j)out_ql[tb*1024+j*8+r]=source_soa?soa_ql[wi*128+j]:source[wi].ql[j];
+            for(int j=0;j<64;++j)out_qh[tb*512+j*8+r]=source_soa?soa_qh[wi*64+j]:source[wi].qh[j];
+            for(int j=0;j<16;++j)out_scales[tb*128+j*8+r]=source_soa?soa_scales[wi*16+j]:source[wi].scales[j];
+            out_d[tb*8+r]=source_soa?soa_d[wi]:source[wi].d;
+        }
+    });
+}
+
+static void unpack_qw_q5_k_xmx_to_soa(
+        const uint8_t *input,uint8_t *output,int ncols,int nrows,dpct::queue_ptr stream){
+    const int blocks=ncols/QK_K,total_tb=(nrows/8)*blocks,nblocks=nrows*blocks;
+    const uint8_t *in_qs=input,*in_qh=in_qs+total_tb*1024,*in_scales=in_qh+total_tb*256;
+    const auto *in_dm=reinterpret_cast<const sycl::half *>(in_scales+total_tb*96);
+    uint8_t *out_qs=output,*out_qh=out_qs+nblocks*128,*out_scales=out_qh+nblocks*32;
+    auto *out_dm=reinterpret_cast<sycl::half2 *>(out_scales+nblocks*12);
+    stream->parallel_for(nblocks,[=](auto index){
+        const int wi=index,row=wi/blocks,b=wi%blocks,rt=row/8,r=row%8,tb=rt*blocks+b;
+        for(int j=0;j<128;++j){const int pair=j/32,pos=j%32,lane=pos&15;const bool high=pos>=16;
+            const uint8_t pe=in_qs[tb*1024+((2*pair)*16+lane)*8+r];
+            const uint8_t po=in_qs[tb*1024+((2*pair+1)*16+lane)*8+r];
+            out_qs[wi*128+j]=(high?pe>>4:pe&15)|((high?po>>4:po&15)<<4);}
+        for(int j=0;j<32;++j)out_qh[wi*32+j]=in_qh[tb*256+j*8+r];
+        for(int j=0;j<12;++j)out_scales[wi*12+j]=in_scales[tb*96+j*8+r];
+        out_dm[wi]=sycl::half2{in_dm[tb*16+r],in_dm[tb*16+8+r]};
+    });
+}
+
+static void unpack_qw_q6_k_xmx_to_soa(
+        const uint8_t *input,uint8_t *output,int ncols,int nrows,dpct::queue_ptr stream){
+    const int blocks=ncols/QK_K,total_tb=(nrows/8)*blocks,nblocks=nrows*blocks;
+    const uint8_t *in_ql=input,*in_qh=in_ql+total_tb*1024;
+    const auto *in_scales=reinterpret_cast<const int8_t *>(in_qh+total_tb*512);
+    const auto *in_d=reinterpret_cast<const sycl::half *>(in_scales+total_tb*128);
+    uint8_t *out_ql=output,*out_qh=out_ql+nblocks*128;
+    auto *out_scales=reinterpret_cast<int8_t *>(out_qh+nblocks*64);
+    auto *out_d=reinterpret_cast<sycl::half *>(out_scales+nblocks*16);
+    stream->parallel_for(nblocks,[=](auto index){
+        const int wi=index,row=wi/blocks,b=wi%blocks,rt=row/8,r=row%8,tb=rt*blocks+b;
+        for(int j=0;j<128;++j)out_ql[wi*128+j]=in_ql[tb*1024+j*8+r];
+        for(int j=0;j<64;++j)out_qh[wi*64+j]=in_qh[tb*512+j*8+r];
+        for(int j=0;j<16;++j)out_scales[wi*16+j]=in_scales[tb*128+j*8+r];
+        out_d[wi]=in_d[tb*8+r];
+    });
+}
+#endif
+
 // Reorder each expert slice into a self-contained SoA layout.
 static bool reorder_qw_q4_k_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert, dpct::queue_ptr stream) {
     GGML_ASSERT(expert_bytes % sizeof(block_q4_K) == 0);
@@ -4371,6 +4531,82 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     }
 }
 
+#ifdef GGML_SYCL_ENABLE_XMX
+// Q4_K N=17..128 may replace the ordinary in-place SoA reorder with the
+// same-size DPAS tile format. The conversion understands both original and
+// SoA input; N<=16 is restored to SoA for the existing small-N paths.
+static void opt_for_q4_xmx_gemm(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+    if (src0->type != GGML_TYPE_Q4_K || src1->ne[1] < 17 || src1->ne[1] > 128 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src0->ne[1] % 32 != 0 ||
+        ggml_sycl_info().devices[ctx.device].hw_info.arch != gpu_arch::intel_gpu_bmg_g31 ||
+        !ggml_sycl_xmx_gemm_is_ready(ctx)) return;
+    auto *extra=static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if(!extra || extra->optimized_feature.q4_xmx) return;
+    const bool source_soa=extra->optimized_feature.reorder;
+    if(reorder_qw_q4_k_xmx(static_cast<uint8_t *>(src0->data),src0->ne[0],src0->ne[1],ggml_nbytes(src0),source_soa,ctx.stream())){
+        extra->optimized_feature.reorder=false;extra->optimized_feature.q4_xmx=true;
+    }
+}
+
+static void restore_q4_xmx_for_small_n(ggml_backend_sycl_context &ctx,const ggml_tensor *src0,const ggml_tensor *src1){
+    auto *extra=static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if(src0->type!=GGML_TYPE_Q4_K||src1->ne[1]>=17||!extra||!extra->optimized_feature.q4_xmx)return;
+    if(restore_qw_q4_k_xmx_to_soa(static_cast<uint8_t *>(src0->data),src0->ne[0],src0->ne[1],ggml_nbytes(src0),ctx.stream())){
+        extra->optimized_feature.q4_xmx=false;extra->optimized_feature.reorder=true;
+    }
+}
+
+static bool ensure_q5_xmx_layout(ggml_backend_sycl_context &ctx,const ggml_tensor *src0){
+    auto *extra=static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if(!extra)return false;if(extra->optimized_feature.q5_xmx)return true;
+    ggml_sycl_pool_alloc<uint8_t> input(ctx.pool(),ggml_nbytes(src0));if(!input.get())return false;
+    ctx.stream()->memcpy(input.get(),src0->data,ggml_nbytes(src0));
+    pack_qw_q5_k_xmx(input.get(),static_cast<uint8_t *>(src0->data),src0->ne[0],src0->ne[1],
+                     extra->optimized_feature.reorder,ctx.stream());
+    extra->optimized_feature.reorder=false;extra->optimized_feature.q5_xmx=true;return true;
+}
+
+static bool ensure_q6_xmx_layout(ggml_backend_sycl_context &ctx,const ggml_tensor *src0){
+    auto *extra=static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    if(!extra)return false;if(extra->optimized_feature.q6_xmx)return true;
+    ggml_sycl_pool_alloc<uint8_t> input(ctx.pool(),ggml_nbytes(src0));if(!input.get())return false;
+    ctx.stream()->memcpy(input.get(),src0->data,ggml_nbytes(src0));
+    pack_qw_q6_k_xmx(input.get(),static_cast<uint8_t *>(src0->data),src0->ne[0],src0->ne[1],
+                     extra->optimized_feature.reorder,ctx.stream());
+    extra->optimized_feature.reorder=false;extra->optimized_feature.q6_xmx=true;return true;
+}
+
+static void restore_q5_q6_xmx_outside_gemm(
+        ggml_backend_sycl_context &ctx,const ggml_tensor *src0,const ggml_tensor *src1){
+    auto *extra=static_cast<ggml_tensor_extra_gpu *>(src0->extra);if(!extra)return;
+    const int64_t n=src1->ne[1];if(n>=17&&n<=64)return;
+    if(src0->type==GGML_TYPE_Q5_K&&extra->optimized_feature.q5_xmx){
+        ggml_sycl_pool_alloc<uint8_t> input(ctx.pool(),ggml_nbytes(src0));if(!input.get())return;
+        ctx.stream()->memcpy(input.get(),src0->data,ggml_nbytes(src0));
+        unpack_qw_q5_k_xmx_to_soa(input.get(),static_cast<uint8_t *>(src0->data),src0->ne[0],src0->ne[1],ctx.stream());
+        extra->optimized_feature.q5_xmx=false;extra->optimized_feature.reorder=true;
+    }else if(src0->type==GGML_TYPE_Q6_K&&extra->optimized_feature.q6_xmx){
+        ggml_sycl_pool_alloc<uint8_t> input(ctx.pool(),ggml_nbytes(src0));if(!input.get())return;
+        ctx.stream()->memcpy(input.get(),src0->data,ggml_nbytes(src0));
+        unpack_qw_q6_k_xmx_to_soa(input.get(),static_cast<uint8_t *>(src0->data),src0->ne[0],src0->ne[1],ctx.stream());
+        extra->optimized_feature.q6_xmx=false;extra->optimized_feature.reorder=true;
+    }
+}
+
+static bool try_mul_mat_q5_K_gemm_xmx(
+        ggml_backend_sycl_context &ctx,const ggml_tensor *src0,const ggml_tensor *src1,ggml_tensor *dst){
+    if(!ggml_sycl_can_use_mul_mat_q5_K_gemm_xmx(ctx,src0,src1,dst)||!ensure_q5_xmx_layout(ctx,src0))return false;
+    ggml_sycl_mul_mat_q5_K_gemm_xmx(ctx,src0,src1,dst);return true;
+}
+
+static bool try_mul_mat_q6_K_gemm_xmx(
+        ggml_backend_sycl_context &ctx,const ggml_tensor *src0,const ggml_tensor *src1,ggml_tensor *dst){
+    if(!ggml_sycl_can_use_mul_mat_q6_K_gemm_xmx(ctx,src0,src1,dst)||!ensure_q6_xmx_layout(ctx,src0))return false;
+    ggml_sycl_mul_mat_q6_K_gemm_xmx(ctx,src0,src1,dst);return true;
+}
+
+#endif
+
 // Lazily reorder supported MoE expert weights once their fused path is used.
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
@@ -4458,6 +4694,37 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
       }
     }
 
+#ifdef GGML_SYCL_ENABLE_XMX
+    if (!split) restore_q4_xmx_for_small_n(ctx, src0, src1);
+    if (!split) restore_q5_q6_xmx_outside_gemm(ctx, src0, src1);
+
+    // A failed restore leaves the native-layout marker set. Do not let MMVQ,
+    // DMMV, or MMQ interpret those bytes as AoS/SoA; the generic F16 path has
+    // native-layout dequantizers and is the safe allocation-failure fallback.
+    if (!split) {
+        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        if (extra && (extra->optimized_feature.q4_xmx ||
+                      extra->optimized_feature.q5_xmx ||
+                      extra->optimized_feature.q6_xmx)) {
+            use_dequantize_mul_mat_vec = false;
+            use_mul_mat_vec_q = false;
+            use_mul_mat_q = false;
+        }
+    }
+
+    if (!split) opt_for_q4_xmx_gemm(ctx, src0, src1);
+    if (!split && ggml_sycl_can_use_mul_mat_q4_K_gemm_xmx(ctx, src0, src1, dst)) {
+        ggml_sycl_mul_mat_q4_K_gemm_xmx(ctx, src0, src1, dst);
+    } else if (!split && try_mul_mat_q5_K_gemm_xmx(ctx, src0, src1, dst)) {
+    } else if (!split && try_mul_mat_q6_K_gemm_xmx(ctx, src0, src1, dst)) {
+    } else if (!split && ggml_sycl_can_use_mul_mat_q4_K_xmx(ctx, src0, src1, dst)) {
+        ggml_sycl_mul_mat_q4_K_xmx(ctx, src0, src1, dst);
+    } else if (!split && ggml_sycl_can_use_mul_mat_q5_K_xmx(ctx, src0, src1, dst)) {
+        ggml_sycl_mul_mat_q5_K_xmx(ctx, src0, src1, dst);
+    } else if (!split && ggml_sycl_can_use_mul_mat_q6_K_xmx(ctx, src0, src1, dst)) {
+        ggml_sycl_mul_mat_q6_K_xmx(ctx, src0, src1, dst);
+    } else
+#endif
     if (!split && src0->type == GGML_TYPE_F16 && ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
         // TODO: Refactor and cleanup of mul mat dispatching.
         if (src0->ne[3] == 1 && src1->ne[3] == 1) {
@@ -6535,6 +6802,10 @@ ggml_backend_t ggml_backend_sycl_init(int device) {
         GGML_LOG_ERROR("%s: error: failed to allocate context\n", __func__);
         return nullptr;
     };
+
+#ifdef GGML_SYCL_ENABLE_XMX
+    ggml_sycl_xmx_init(*ctx);
+#endif
 
     ggml_backend_t sycl_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_sycl_guid(),
